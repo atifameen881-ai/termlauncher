@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.hardware.camera2.CameraManager
@@ -34,7 +35,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -56,6 +59,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
@@ -111,6 +120,8 @@ suspend fun loadApps(ctx: Context): List<App> = withContext(Dispatchers.IO) {
 val HELP = listOf(
     "-- shell --",
     "anything else runs in sh",
+    "files: /sdcard/atif@anom",
+    "grant = allow file access",
     "cd <dir>  ls  cat  grep  ps ...",
     "tab = autocomplete",
     "ctrl+c stop  ctrl+l clear",
@@ -136,6 +147,10 @@ val HELP = listOf(
     "note [text|-d n|-c]",
     "copy <text>  paste",
     "weather [city]  roll [n]  coin",
+    "-- fun --",
+    "cmatrix (tap to exit)",
+    "fortune  cowsay <t>  8ball <q>",
+    "pass [len]  uuid  hack",
     "-- web --",
     "web <url>  google <q>  yt <q>",
     "call <number>",
@@ -153,12 +168,13 @@ val COMMANDS = listOf(
     "web", "url", "google", "search", "yt", "youtube", "dial", "call", "phone", "camera", "cam",
     "mail", "gmail", "email", "sms", "messages", "msg", "contacts", "settings",
     "wifi", "bt", "bluetooth", "display", "info", "uninstall", "theme", "history", "apps", "app",
-    "statusbar", "status", "cd",
+    "statusbar", "status", "cd", "grant", "cmatrix", "fortune", "cowsay", "8ball", "pass", "uuid", "hack",
     "ls", "cat", "pwd", "echo", "grep", "ps", "top", "df", "free", "date", "uname", "uptime",
     "whoami", "id", "env", "ping", "getprop", "mkdir", "rm", "cp", "mv", "touch", "head", "tail",
     "wc", "find", "du", "sleep", "stat", "ip", "ifconfig", "netstat", "hostname", "nproc"
 ).distinct().sorted()
 
+@Stable
 class Term(private val ctx: Context) {
     val lines = mutableStateListOf("atif@anom launcher v0.3", "type 'help' for commands", "")
     var input by mutableStateOf("")
@@ -171,18 +187,28 @@ class Term(private val ctx: Context) {
     private val prefs = ctx.getSharedPreferences("term", Context.MODE_PRIVATE)
     private val ui = Handler(Looper.getMainLooper())
     private var torch = false
-    private val home: File = ctx.filesDir
-    var cwd by mutableStateOf(home)
-    private var oldCwd: File = home
+    private val fallbackHome: File = ctx.filesDir
+    var home by mutableStateOf(fallbackHome)
+    var cwd by mutableStateOf(fallbackHome)
+    private var oldCwd: File = fallbackHome
+    var hasStorage by mutableStateOf(false)
+    var fx by mutableStateOf<String?>(null)
     @Volatile private var proc: Process? = null
     private var running = false
     var statusHidden by mutableStateOf(prefs.getBoolean("hide_status", true))
     private val shellPath = listOf("/system/bin/bash", "/system/xbin/bash")
         .firstOrNull { File(it).canExecute() } ?: "/system/bin/sh"
 
-    init { applyTheme(prefs.getString("theme", "charcoal") ?: "charcoal") }
+    init {
+        applyTheme(prefs.getString("theme", "charcoal") ?: "charcoal")
+        refreshHome()
+        if (!hasStorage) out("no file access yet - type 'grant' to use /sdcard/atif@anom")
+    }
 
-    fun out(s: String) { s.split("\n").forEach { lines.add(it) } }
+    fun out(s: String) {
+        s.split("\n").forEach { lines.add(it) }
+        if (lines.size > 1100) repeat(lines.size - 1000) { lines.removeAt(0) }
+    }
     fun type(s: String) { input += s }
     fun back() { input = input.dropLast(1) }
 
@@ -221,6 +247,7 @@ class Term(private val ctx: Context) {
     }
 
     private fun submit() {
+        refreshHome()
         val raw = input.trim()
         lines.add("${prompt()} $raw")
         input = ""
@@ -269,6 +296,15 @@ class Term(private val ctx: Context) {
             "mail", "gmail", "email" -> openPkg("com.google.android.gm") { openCat(Intent.CATEGORY_APP_EMAIL) }
             "sms", "messages", "msg" -> openCat(Intent.CATEGORY_APP_MESSAGING)
             "contacts" -> openCat(Intent.CATEGORY_APP_CONTACTS)
+
+            "grant" -> grant()
+            "cmatrix" -> fx = "matrix"
+            "fortune" -> out(FORTUNES.random())
+            "cowsay" -> out(cowsay(a.joinToString(" ")))
+            "8ball" -> out(if (a.isEmpty()) "ask a question: 8ball <q>" else EIGHT.random())
+            "pass" -> out(pass(a.firstOrNull()?.toIntOrNull() ?: 16))
+            "uuid" -> out(java.util.UUID.randomUUID().toString())
+            "hack" -> hack()
 
             "settings" -> sys(Settings.ACTION_SETTINGS)
             "wifi" -> sys(Settings.ACTION_WIFI_SETTINGS)
@@ -350,17 +386,27 @@ class Term(private val ctx: Context) {
                 val p = pb.start()
                 proc = p
                 p.outputStream.close()
-                p.inputStream.bufferedReader().useLines { seq ->
-                    for (l in seq) {
-                        count++
-                        if (count > 5000) {
-                            p.destroyForcibly()
-                            ui.post { out("[output truncated]") }
-                            break
-                        }
-                        ui.post { out(l.replace("\t", "    ")) }
-                    }
+                val rd = p.inputStream.bufferedReader()
+                val pending = ArrayList<String>()
+                fun flush() {
+                    if (pending.isEmpty()) return
+                    val chunk = pending.joinToString("\n")
+                    pending.clear()
+                    ui.post { out(chunk) }
                 }
+                while (true) {
+                    val l = rd.readLine() ?: break
+                    count++
+                    if (count > 5000) {
+                        p.destroyForcibly()
+                        pending.add("[output truncated]")
+                        break
+                    }
+                    pending.add(l.replace("\t", "    "))
+                    if (pending.size >= 100 || !rd.ready()) flush()
+                }
+                flush()
+                rd.close()
                 val code = p.waitFor()
                 ui.post { if (code != 0 && code != 143 && code != 137) out("[exit $code]") }
             } catch (e: Exception) {
@@ -444,6 +490,87 @@ class Term(private val ctx: Context) {
             ?.filter { !it.startsWith(".") || namePart.startsWith(".") }
             ?.sorted() ?: return
         complete(head + dirPart, namePart, names)
+    }
+
+    // ---- storage ----
+
+    private fun storageGranted(): Boolean =
+        if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
+        else ctx.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+
+    fun refreshHome() {
+        if (!storageGranted()) { hasStorage = false; return }
+        val d = File(Environment.getExternalStorageDirectory(), "atif@anom")
+        if (!d.isDirectory && !d.mkdirs()) { hasStorage = false; return }
+        hasStorage = true
+        if (home.path == d.path) return
+        val atHome = cwd.path == home.path
+        home = d
+        oldCwd = d
+        if (atHome) cwd = d
+        out("storage ready: ${d.path}")
+    }
+
+    private fun grant() {
+        if (hasStorage) { out("file access already allowed: ${home.path}"); return }
+        if (Build.VERSION.SDK_INT >= 30)
+            go(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${ctx.packageName}")))
+        else
+            go(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}")))
+        out("allow 'All files access' (or Storage), then come back")
+    }
+
+    // ---- fun ----
+
+    private fun cowsay(text: String): String {
+        val words = text.ifBlank { "moo" }.split(Regex("\\s+"))
+        val ls = mutableListOf<String>()
+        var cur = ""
+        for (w in words) {
+            if (cur.isEmpty()) cur = w
+            else if (cur.length + 1 + w.length <= 24) cur += " $w"
+            else { ls.add(cur); cur = w }
+        }
+        if (cur.isNotEmpty()) ls.add(cur)
+        val width = ls.maxOf { it.length }
+        val sb = StringBuilder(" " + "_".repeat(width + 2) + "\n")
+        if (ls.size == 1) sb.append("< ${ls[0]} >\n")
+        else ls.forEachIndexed { i, l ->
+            val (x, y) = when (i) {
+                0 -> "/" to "\\"
+                ls.size - 1 -> "\\" to "/"
+                else -> "|" to "|"
+            }
+            sb.append("$x ${l.padEnd(width)} $y\n")
+        }
+        sb.append(" " + "-".repeat(width + 2) + "\n")
+        sb.append("        \\   ^__^\n")
+        sb.append("         \\  (oo)\\_______\n")
+        sb.append("            (__)\\       )\\/\\\n")
+        sb.append("                ||----w |\n")
+        sb.append("                ||     ||")
+        return sb.toString()
+    }
+
+    private fun pass(n: Int): String {
+        val len = n.coerceIn(4, 64)
+        val set = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^&*-_=+"
+        val r = java.security.SecureRandom()
+        return (1..len).map { set[r.nextInt(set.length)] }.joinToString("")
+    }
+
+    private fun hack() {
+        val steps = listOf(
+            "[*] scanning 192.168.0.0/24 ...",
+            "[+] host found: 192.168.0.1",
+            "[*] bypassing firewall ...",
+            "[+] firewall bypassed",
+            "[*] injecting payload ...",
+            "[+] root access granted",
+            "[*] downloading the mainframe ...",
+            "[!] just kidding. nothing happened."
+        )
+        steps.forEachIndexed { i, l -> ui.postDelayed({ out(l) }, i * 350L) }
     }
 
     // ---- misc ----
@@ -691,7 +818,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) term?.let { applyBars(it.statusHidden) }
+        if (hasFocus) term?.let { applyBars(it.statusHidden); it.refreshHome() }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -712,12 +839,40 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun Screen(t: Term) {
-    val fr = remember { FocusRequester() }
-    var blink by remember { mutableStateOf(true) }
+    BackHandler(enabled = t.fx != null) { t.fx = null }
+    if (t.fx == "matrix") MatrixRain { t.fx = null } else Terminal(t)
+}
+
+@Composable
+fun Clock() {
     var now by remember { mutableStateOf(Date()) }
-    LaunchedEffect(Unit) { fr.requestFocus() }
-    LaunchedEffect(Unit) { while (true) { delay(530); blink = !blink } }
     LaunchedEffect(Unit) { while (true) { now = Date(); delay(1000) } }
+    Text(
+        SimpleDateFormat("EEE d MMM  HH:mm:ss", Locale.getDefault()).format(now),
+        color = DIM, fontFamily = Mono, fontSize = 11.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)
+    )
+}
+
+@Composable
+fun InputLine(t: Term) {
+    var blink by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) { while (true) { delay(530); blink = !blink } }
+    Text(
+        buildAnnotatedString {
+            withStyle(SpanStyle(color = ACC)) { append(t.prompt() + " ") }
+            append(t.input)
+            withStyle(SpanStyle(color = ACC)) { append(if (blink) "█" else " ") }
+        },
+        color = FG, fontFamily = Mono, fontSize = 14.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)
+    )
+}
+
+@Composable
+fun Terminal(t: Term) {
+    val fr = remember { FocusRequester() }
+    LaunchedEffect(Unit) { fr.requestFocus() }
     BackHandler { t.grid = null }
 
     Column(
@@ -755,11 +910,7 @@ fun Screen(t: Term) {
                 true
             }
     ) {
-        Text(
-            SimpleDateFormat("EEE d MMM  HH:mm:ss", Locale.getDefault()).format(now),
-            color = DIM, fontFamily = Mono, fontSize = 11.sp,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)
-        )
+        Clock()
 
         val g = t.grid
         if (g != null) {
@@ -784,15 +935,7 @@ fun Screen(t: Term) {
             }
         }
 
-        Text(
-            buildAnnotatedString {
-                withStyle(SpanStyle(color = ACC)) { append(t.prompt() + " ") }
-                append(t.input)
-                withStyle(SpanStyle(color = ACC)) { append(if (blink) "█" else " ") }
-            },
-            color = FG, fontFamily = Mono, fontSize = 14.sp,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)
-        )
+        InputLine(t)
         Keyboard(t)
         Spacer(Modifier.height(12.dp))
     }
@@ -1031,6 +1174,107 @@ class Expr(private val s: String) {
             "ln" -> Math.log(v)
             "abs" -> Math.abs(v)
             else -> throw IllegalArgumentException("unknown '$name'")
+        }
+    }
+}
+
+val FORTUNES = listOf(
+    "It works on my machine.",
+    "There is no cloud, only someone else's computer.",
+    "Have you tried turning it off and on again?",
+    "A watched compile never finishes.",
+    "Weeks of coding can save you hours of planning.",
+    "rm -rf is forever. Think twice.",
+    "The best code is the code you didn't write.",
+    "Today's bug is tomorrow's feature.",
+    "sudo make me a sandwich.",
+    "Commit early, commit often, push carefully."
+)
+
+val EIGHT = listOf(
+    "It is certain.", "Without a doubt.", "Yes, definitely.", "Most likely.", "Signs point to yes.",
+    "Reply hazy, try again.", "Ask again later.", "Cannot predict now.",
+    "Don't count on it.", "My sources say no.", "Very doubtful."
+)
+
+const val GLYPHS = "ｦｱｳｴｵｶｷｹｺｻｼｽｾﾀﾂﾃﾅﾆﾇﾈﾊﾋﾎﾏﾐﾑﾒﾓﾔﾕﾗﾘﾜ0123456789:.=*+-<>|"
+
+class Rain(val cols: Int, val rows: Int) {
+    private val rnd = java.util.Random()
+    val head = IntArray(cols) { -rnd.nextInt(rows) }
+    val len = IntArray(cols) { 6 + rnd.nextInt(20) }
+    val chars = CharArray(cols * rows) { pick() }
+
+    private fun pick() = GLYPHS[rnd.nextInt(GLYPHS.length)]
+
+    fun step() {
+        for (c in 0 until cols) {
+            head[c]++
+            val h = head[c]
+            if (h in 0 until rows) chars[c * rows + h] = pick()
+            if (h - len[c] >= rows) {
+                head[c] = -rnd.nextInt(rows / 2 + 1)
+                len[c] = 6 + rnd.nextInt(20)
+            }
+            if (rnd.nextInt(4) == 0) {
+                val rr = h - rnd.nextInt(len[c])
+                if (rr in 0 until rows) chars[c * rows + rr] = pick()
+            }
+        }
+    }
+}
+
+@Composable
+fun MatrixRain(onExit: () -> Unit) {
+    val fr = remember { FocusRequester() }
+    var size by remember { mutableStateOf(IntSize.Zero) }
+    var tick by remember { mutableIntStateOf(0) }
+    val d = LocalDensity.current.density
+    val cw = 12f * d
+    val chh = 17f * d
+    val rain = remember(size) {
+        if (size.width > 0 && size.height > 0)
+            Rain((size.width / cw).toInt().coerceAtLeast(1), (size.height / chh).toInt().coerceAtLeast(1))
+        else null
+    }
+    val paint = remember {
+        android.graphics.Paint().apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+    }
+    paint.textSize = chh * 0.85f
+    LaunchedEffect(Unit) { fr.requestFocus() }
+    LaunchedEffect(rain) {
+        while (rain != null) { delay(60); rain.step(); tick++ }
+    }
+    Canvas(
+        Modifier
+            .fillMaxSize()
+            .onSizeChanged { size = it }
+            .focusRequester(fr)
+            .focusable()
+            .onPreviewKeyEvent { if (it.type == KeyEventType.KeyDown) { onExit(); true } else false }
+            .pointerInput(Unit) { detectTapGestures { onExit() } }
+    ) {
+        val r = rain
+        if (r == null || tick < 0) return@Canvas
+        drawRect(Color.Black)
+        drawIntoCanvas { c ->
+            val nc = c.nativeCanvas
+            for (col in 0 until r.cols) {
+                val h = r.head[col]
+                val l = r.len[col]
+                val x = col * cw + cw / 2
+                for (k in 0 until l) {
+                    val row = h - k
+                    if (row < 0 || row >= r.rows) continue
+                    paint.color =
+                        if (k == 0) android.graphics.Color.rgb(215, 255, 215)
+                        else android.graphics.Color.argb((230 * (l - k) / l).coerceAtLeast(25), 0, 255, 65)
+                    nc.drawText(r.chars, col * r.rows + row, 1, x, row * chh + chh * 0.85f, paint)
+                }
+            }
         }
     }
 }
