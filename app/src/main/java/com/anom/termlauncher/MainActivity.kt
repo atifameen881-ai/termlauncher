@@ -18,6 +18,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.MediaStore
 import android.provider.Settings
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.NetworkInterface
 import java.net.URL
@@ -44,7 +45,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -53,6 +53,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.key.Key
@@ -71,6 +72,9 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -84,7 +88,7 @@ var DIM by mutableStateOf(Color(0xFF7A7468))
 var ACC by mutableStateOf(Color(0xFFC8A15A))
 var KEYBG by mutableStateOf(Color(0xFF262626))
 val Mono = FontFamily.Monospace
-const val PS = "atif@anom:~$"
+const val PS = "atif@anom:"
 
 data class App(val label: String, val pkg: String, val icon: ImageBitmap)
 
@@ -104,8 +108,59 @@ suspend fun loadApps(ctx: Context): List<App> = withContext(Dispatchers.IO) {
         .sortedBy { it.label.lowercase() }
 }
 
+val HELP = listOf(
+    "-- shell --",
+    "anything else runs in sh",
+    "cd <dir>  ls  cat  grep  ps ...",
+    "tab = autocomplete",
+    "ctrl+c stop  ctrl+l clear",
+    "ctrl+u wipe line  ctrl+w word",
+    "-- apps --",
+    "apps | app -l     app grid",
+    "app -o <name>     open app",
+    "app -s <q>        search apps",
+    "app -r            rescan apps",
+    "info <app>  uninstall <app>",
+    "-- quick open --",
+    "call phone sms contacts camera mail",
+    "(other apps: app -o <name>)",
+    "-- system --",
+    "fastfetch battery ram storage cpu",
+    "net myip ver clock cal",
+    "torch [on|off]",
+    "vol [up|down|0-100|mute|max]",
+    "settings wifi bt display",
+    "statusbar [show|hide|toggle]",
+    "-- tools --",
+    "calc <expr>  timer <sec> [label]",
+    "note [text|-d n|-c]",
+    "copy <text>  paste",
+    "weather [city]  roll [n]  coin",
+    "-- web --",
+    "web <url>  google <q>  yt <q>",
+    "call <number>",
+    "-- shell --",
+    "theme [name]  history  clear",
+    "",
+    "grid: tap app, or arrows + enter",
+    "back button closes the grid"
+).joinToString("\n")
+
+val COMMANDS = listOf(
+    "help", "clear", "cls", "clock", "fastfetch", "neofetch", "battery", "ram", "storage", "cpu",
+    "myip", "net", "ver", "version", "sudo", "cal", "calc", "bc", "coin", "roll", "torch", "flash",
+    "flashlight", "vol", "volume", "timer", "note", "notes", "copy", "paste", "weather", "wttr",
+    "web", "url", "google", "search", "yt", "youtube", "dial", "call", "phone", "camera", "cam",
+    "mail", "gmail", "email", "sms", "messages", "msg", "contacts", "settings",
+    "wifi", "bt", "bluetooth", "display", "info", "uninstall", "theme", "history", "apps", "app",
+    "statusbar", "status", "cd",
+    "ls", "cat", "pwd", "echo", "grep", "ps", "top", "df", "free", "date", "uname", "uptime",
+    "whoami", "id", "env", "ping", "getprop", "mkdir", "rm", "cp", "mv", "touch", "head", "tail",
+    "wc", "find", "du", "sleep", "stat", "ip", "ifconfig", "netstat", "hostname", "nproc"
+).distinct().sorted()
+
 class Term(private val ctx: Context) {
-    val lines = mutableStateListOf("atif@anom launcher v0.2", "type 'help' for commands", "")
+    val lines = mutableStateListOf("atif@anom launcher v0.3", "type 'help' for commands", "")
     var input by mutableStateOf("")
     var grid by mutableStateOf<List<App>?>(null)
     var sel by mutableIntStateOf(0)
@@ -116,6 +171,14 @@ class Term(private val ctx: Context) {
     private val prefs = ctx.getSharedPreferences("term", Context.MODE_PRIVATE)
     private val ui = Handler(Looper.getMainLooper())
     private var torch = false
+    private val home: File = ctx.filesDir
+    var cwd by mutableStateOf(home)
+    private var oldCwd: File = home
+    @Volatile private var proc: Process? = null
+    private var running = false
+    var statusHidden by mutableStateOf(prefs.getBoolean("hide_status", true))
+    private val shellPath = listOf("/system/bin/bash", "/system/xbin/bash")
+        .firstOrNull { File(it).canExecute() } ?: "/system/bin/sh"
 
     init { applyTheme(prefs.getString("theme", "charcoal") ?: "charcoal") }
 
@@ -146,9 +209,20 @@ class Term(private val ctx: Context) {
 
     private fun launchSel() { grid?.getOrNull(sel)?.let { launch(it) } }
 
+    fun prompt(): String {
+        val p = cwd.path
+        val h = home.path
+        val shown = when {
+            p == h -> "~"
+            p.startsWith("$h/") -> "~" + p.removePrefix(h)
+            else -> p
+        }
+        return "$PS$shown\$"
+    }
+
     private fun submit() {
         val raw = input.trim()
-        lines.add("$PS $raw")
+        lines.add("${prompt()} $raw")
         input = ""
         if (raw.isEmpty()) return
         history.add(raw)
@@ -158,61 +232,20 @@ class Term(private val ctx: Context) {
         val a = p.drop(1)
         grid = null
         when (c) {
-            "help" -> out(
-                listOf(
-                    "-- apps --",
-                    "ls | app -l       app grid (4x4)",
-                    "app -s <q>        search apps",
-                    "app <name>        launch app",
-                    "app -r            rescan apps",
-                    "info <app>        app settings page",
-                    "uninstall <app>",
-                    "-- system --",
-                    "fastfetch battery ram storage cpu",
-                    "uptime uname ip net ver",
-                    "torch [on|off]    flashlight",
-                    "vol [up|down|0-100|mute|max]",
-                    "settings wifi bt display camera",
-                    "-- tools --",
-                    "date time cal",
-                    "calc <expr>       calc 2*(3+4)^2",
-                    "timer <sec> [label]",
-                    "note [text|-d n|-c]",
-                    "copy <text>  paste",
-                    "weather [city]",
-                    "roll [n]  coin",
-                    "-- web --",
-                    "web <url>  google <q>  yt <q>",
-                    "dial <number>",
-                    "-- shell --",
-                    "theme [name]  (charcoal green amber",
-                    "               blue mono)",
-                    "history echo clear whoami hostname pwd",
-                    "",
-                    "grid: tap app, or arrows + enter",
-                    "back button closes the grid"
-                ).joinToString("\n")
-            )
+            "help" -> out(HELP)
             "clear", "cls" -> lines.clear()
-            "date" -> out(fmt("EEEE, d MMMM yyyy"))
-            "time", "clock" -> out(fmt("HH:mm:ss"))
+            "clock" -> out(fmt("EEEE, d MMMM yyyy  HH:mm:ss"))
             "fastfetch", "neofetch" -> fetch()
             "battery" -> out(battery())
-            "ram", "free" -> { val m = mem(); out("${gb(m.totalMem - m.availMem)} / ${gb(m.totalMem)}") }
-            "storage", "df" -> out(disk())
-            "uptime" -> out(uptime())
-            "uname" -> out("Linux ${System.getProperty("os.version")} ${Build.SUPPORTED_ABIS.firstOrNull()}")
-            "whoami" -> out("atif")
-            "hostname" -> out("anom")
-            "echo" -> out(a.joinToString(" "))
-            "pwd" -> out("/home/atif")
-            "ver", "version" -> out("anomsh 0.2 - Android ${Build.VERSION.RELEASE}")
+            "ram" -> { val m = mem(); out("${gb(m.totalMem - m.availMem)} / ${gb(m.totalMem)}") }
+            "storage" -> out(disk())
+            "cpu" -> out("${Runtime.getRuntime().availableProcessors()} cores, ${Build.HARDWARE}, ${Build.SUPPORTED_ABIS.joinToString(",")}")
+            "myip" -> out(ip())
+            "net" -> out(net())
+            "ver", "version" -> out("anomsh 0.3 - Android ${Build.VERSION.RELEASE}")
             "sudo" -> out("atif is not in the sudoers file. This incident will be reported.")
             "cal" -> out(cal())
             "calc", "bc" -> out(calc(a.joinToString(" ")))
-            "ip" -> out(ip())
-            "net" -> out(net())
-            "cpu", "nproc" -> out("${Runtime.getRuntime().availableProcessors()} cores, ${Build.HARDWARE}, ${Build.SUPPORTED_ABIS.joinToString(",")}")
             "coin" -> out(if (Random.nextBoolean()) "heads" else "tails")
             "roll" -> { val n = a.firstOrNull()?.toIntOrNull()?.coerceAtLeast(2) ?: 6; out("d$n -> ${Random.nextInt(1, n + 1)}") }
             "torch", "flash", "flashlight" -> flash(a.firstOrNull())
@@ -224,9 +257,19 @@ class Term(private val ctx: Context) {
             "weather", "wttr" -> weather(a.joinToString(" "))
             "web", "url" -> if (a.isEmpty()) out("usage: web <url>") else view(if (a[0].startsWith("http")) a[0] else "https://" + a[0])
             "google", "search" -> view("https://www.google.com/search?q=" + Uri.encode(a.joinToString(" ")))
-            "yt", "youtube" -> view("https://www.youtube.com/results?search_query=" + Uri.encode(a.joinToString(" ")))
-            "dial", "call" -> if (a.isEmpty()) out("usage: dial <number>") else go(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(a[0]))))
-            "camera" -> go(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))
+            "yt", "youtube" ->
+                if (a.isEmpty()) out("usage: yt <query>")
+                else view("https://www.youtube.com/results?search_query=" + Uri.encode(a.joinToString(" ")))
+
+            // direct app commands
+            "dial", "call", "phone" ->
+                if (a.isEmpty()) go(Intent(Intent.ACTION_DIAL))
+                else go(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(a[0]))))
+            "camera", "cam" -> go(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))
+            "mail", "gmail", "email" -> openPkg("com.google.android.gm") { openCat(Intent.CATEGORY_APP_EMAIL) }
+            "sms", "messages", "msg" -> openCat(Intent.CATEGORY_APP_MESSAGING)
+            "contacts" -> openCat(Intent.CATEGORY_APP_CONTACTS)
+
             "settings" -> sys(Settings.ACTION_SETTINGS)
             "wifi" -> sys(Settings.ACTION_WIFI_SETTINGS)
             "bt", "bluetooth" -> sys(Settings.ACTION_BLUETOOTH_SETTINGS)
@@ -234,18 +277,24 @@ class Term(private val ctx: Context) {
             "info" -> find(a)?.let { go(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${it.pkg}"))) }
             "uninstall" -> find(a)?.let { go(Intent(Intent.ACTION_DELETE, Uri.parse("package:${it.pkg}"))) }
             "theme" -> theme(a)
+            "statusbar", "status" -> statusbar(a)
             "history" -> history.forEachIndexed { i, h -> out("${i + 1}  $h") }
-            "ls" -> app(listOf("-l"))
+            "apps" -> app(listOf("-l"))
             "app" -> app(a)
-            else -> out("$c: command not found")
+            "cd" -> cd(a)
+            else -> sh(raw)
         }
     }
 
     private fun app(a: List<String>) {
-        if (a.isEmpty()) { out("usage: app -l | -s <q> | -r | <name>"); return }
+        if (a.isEmpty()) { out("usage: app -l | -o <name> | -s <q> | -r | <name>"); return }
         when (a[0]) {
             "-l", "--list" -> { grid = apps; sel = 0; out("${apps.size} apps") }
             "-r", "--rescan" -> { reloadTick++; out("rescanning...") }
+            "-o", "--open" -> {
+                val m = find(a.drop(1))
+                if (m != null) { out("launching ${m.label}"); launch(m) }
+            }
             "-s", "--search" -> {
                 val q = a.drop(1).joinToString(" ").lowercase()
                 val m = apps.filter { it.label.lowercase().contains(q) }
@@ -262,6 +311,163 @@ class Term(private val ctx: Context) {
                     else -> { grid = m; sel = 0; out("${m.size} matches") }
                 }
             }
+        }
+    }
+
+    // ---- real shell ----
+
+    private fun cd(a: List<String>) {
+        val arg = a.joinToString(" ")
+        val target = when {
+            arg.isEmpty() || arg == "~" -> home
+            arg == "-" -> oldCwd
+            arg.startsWith("~/") -> File(home, arg.drop(2))
+            arg.startsWith("/") -> File(arg)
+            else -> File(cwd, arg)
+        }
+        val d = try { target.canonicalFile } catch (e: Exception) { target }
+        if (d.isDirectory) { oldCwd = cwd; cwd = d } else out("cd: $arg: no such directory")
+    }
+
+    private fun sh(cmd: String) {
+        if (running) { out("busy - ctrl+c stops the running command"); return }
+        running = true
+        val dir = cwd
+        Thread {
+            var count = 0
+            try {
+                val pb = ProcessBuilder(shellPath, "-c", cmd)
+                pb.directory(dir)
+                pb.redirectErrorStream(true)
+                pb.environment().apply {
+                    put("HOME", home.path)
+                    put("USER", "atif")
+                    put("TERM", "dumb")
+                    put("PWD", dir.path)
+                    put("TMPDIR", ctx.cacheDir.path)
+                    if (get("PATH").isNullOrEmpty()) put("PATH", "/system/bin:/system/xbin")
+                }
+                val p = pb.start()
+                proc = p
+                p.outputStream.close()
+                p.inputStream.bufferedReader().useLines { seq ->
+                    for (l in seq) {
+                        count++
+                        if (count > 5000) {
+                            p.destroyForcibly()
+                            ui.post { out("[output truncated]") }
+                            break
+                        }
+                        ui.post { out(l.replace("\t", "    ")) }
+                    }
+                }
+                val code = p.waitFor()
+                ui.post { if (code != 0 && code != 143 && code != 137) out("[exit $code]") }
+            } catch (e: Exception) {
+                ui.post { out("sh: ${e.message}") }
+            } finally {
+                proc = null
+                ui.post { running = false }
+            }
+        }.start()
+    }
+
+    fun ctrl(c: Char) {
+        when (c.lowercaseChar()) {
+            'c' -> {
+                if (running) { proc?.destroyForcibly(); out("^C") }
+                else { lines.add("${prompt()} $input^C"); input = "" }
+            }
+            'l' -> lines.clear()
+            'u' -> input = ""
+            'w' -> {
+                val s = input.trimEnd().substringBeforeLast(' ', "")
+                input = if (s.isEmpty()) "" else "$s "
+            }
+            'p' -> arrow(0, -1)
+            'n' -> arrow(0, 1)
+        }
+    }
+
+    // ---- tab completion ----
+
+    fun tab() {
+        val raw = input
+        val sp = raw.indexOf(' ')
+        if (sp < 0) { complete("", raw, COMMANDS); return }
+        val head0 = raw.substring(0, sp + 1)
+        val cmd = raw.substring(0, sp).lowercase()
+        val rest = raw.substring(sp + 1)
+        val labels = apps.map { it.label.lowercase() }
+        when (cmd) {
+            "info", "uninstall" -> complete(head0, rest, labels)
+            "app" -> when {
+                rest.isEmpty() || (rest.startsWith("-") && !rest.contains(' ')) ->
+                    complete(head0, rest, listOf("-l", "-o", "-s", "-r"))
+                rest.startsWith("-o ") || rest.startsWith("-s ") ->
+                    complete(head0 + rest.take(3), rest.drop(3), labels)
+                else -> complete(head0, rest, labels)
+            }
+            "theme" -> complete(head0, rest, THEMES.keys.toList())
+            "statusbar", "status" -> complete(head0, rest, listOf("show", "hide", "toggle"))
+            "torch", "flash", "flashlight" -> complete(head0, rest, listOf("on", "off"))
+            "vol", "volume" -> complete(head0, rest, listOf("up", "down", "mute", "max"))
+            else -> completePath(raw)
+        }
+    }
+
+    private fun complete(head: String, token: String, cands: List<String>) {
+        val m = cands.filter { it.startsWith(token, ignoreCase = true) }.distinct()
+        if (m.isEmpty()) return
+        if (m.size == 1) {
+            input = head + m[0] + (if (m[0].endsWith("/")) "" else " ")
+            return
+        }
+        val lcp = m.reduce { x, y -> x.commonPrefixWith(y, ignoreCase = true) }
+        if (lcp.length > token.length) input = head + lcp
+        else { lines.add("${prompt()} $input"); out(m.take(60).joinToString("  ")) }
+    }
+
+    private fun completePath(raw: String) {
+        val head = raw.substringBeforeLast(' ', "") + " "
+        val tok = raw.substringAfterLast(' ')
+        val slash = tok.lastIndexOf('/')
+        val dirPart = if (slash >= 0) tok.substring(0, slash + 1) else ""
+        val namePart = tok.substring(slash + 1)
+        val dir = when {
+            dirPart.startsWith("/") -> File(dirPart)
+            dirPart.startsWith("~") -> File(home, dirPart.removePrefix("~").trimStart('/'))
+            else -> File(cwd, dirPart)
+        }
+        val names = dir.listFiles()
+            ?.map { if (it.isDirectory) it.name + "/" else it.name }
+            ?.filter { !it.startsWith(".") || namePart.startsWith(".") }
+            ?.sorted() ?: return
+        complete(head + dirPart, namePart, names)
+    }
+
+    // ---- misc ----
+
+    private fun statusbar(a: List<String>) {
+        statusHidden = when (a.firstOrNull()?.lowercase()) {
+            "show", "on" -> false
+            "hide", "off" -> true
+            null, "toggle" -> !statusHidden
+            else -> { out("usage: statusbar [show|hide|toggle]"); return }
+        }
+        prefs.edit().putBoolean("hide_status", statusHidden).apply()
+        out("status bar " + if (statusHidden) "hidden" else "shown")
+    }
+
+    private fun openCat(category: String) =
+        go(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, category))
+
+    private fun openPkg(pkg: String, fallback: (() -> Unit)? = null) {
+        val i = ctx.packageManager.getLaunchIntentForPackage(pkg)
+        when {
+            i != null -> go(i)
+            fallback != null -> fallback()
+            else -> out("not installed: $pkg")
         }
     }
 
@@ -474,6 +680,20 @@ class Term(private val ctx: Context) {
 }
 
 class MainActivity : ComponentActivity() {
+    private var term: Term? = null
+
+    private fun applyBars(hidden: Boolean) {
+        val c = WindowCompat.getInsetsController(window, window.decorView)
+        c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (hidden) c.hide(WindowInsetsCompat.Type.statusBars())
+        else c.show(WindowInsetsCompat.Type.statusBars())
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) term?.let { applyBars(it.statusHidden) }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
@@ -482,7 +702,9 @@ class MainActivity : ComponentActivity() {
         )
         setContent {
             val t = remember { Term(applicationContext) }
+            term = t
             LaunchedEffect(t.reloadTick) { t.apps = loadApps(applicationContext) }
+            LaunchedEffect(t.statusHidden) { applyBars(t.statusHidden) }
             Screen(t)
         }
     }
@@ -503,10 +725,18 @@ fun Screen(t: Term) {
             .fillMaxSize()
             .background(BG)
             .systemBarsPadding()
+            .displayCutoutPadding()
             .focusRequester(fr)
             .focusable()
             .onPreviewKeyEvent { e ->
                 if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                if (e.isCtrlPressed) {
+                    val cc = when (e.key) {
+                        Key.C -> 'c'; Key.L -> 'l'; Key.U -> 'u'; Key.W -> 'w'; Key.P -> 'p'; Key.N -> 'n'
+                        else -> null
+                    }
+                    if (cc != null) { t.ctrl(cc); return@onPreviewKeyEvent true }
+                }
                 when (e.key) {
                     Key.Enter, Key.NumPadEnter -> t.enter()
                     Key.Backspace -> t.back()
@@ -515,6 +745,7 @@ fun Screen(t: Term) {
                     Key.DirectionUp -> t.arrow(0, -1)
                     Key.DirectionDown -> t.arrow(0, 1)
                     Key.Escape -> t.grid = null
+                    Key.Tab -> t.tab()
                     else -> {
                         val cp = e.utf16CodePoint
                         if (cp >= 32 && !e.isCtrlPressed) t.type(String(Character.toChars(cp)))
@@ -555,7 +786,7 @@ fun Screen(t: Term) {
 
         Text(
             buildAnnotatedString {
-                withStyle(SpanStyle(color = ACC)) { append("$PS ") }
+                withStyle(SpanStyle(color = ACC)) { append(t.prompt() + " ") }
                 append(t.input)
                 withStyle(SpanStyle(color = ACC)) { append(if (blink) "█" else " ") }
             },
@@ -563,6 +794,7 @@ fun Screen(t: Term) {
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)
         )
         Keyboard(t)
+        Spacer(Modifier.height(12.dp))
     }
 }
 
@@ -584,7 +816,7 @@ fun AppGrid(t: Term, list: List<App>, modifier: Modifier = Modifier) {
                             val a = list.getOrNull(idx)
                             Box(Modifier.weight(1f).fillMaxHeight()) {
                                 if (a != null) {
-                                    val shape = RoundedCornerShape(6.dp)
+                                    val shape = RectangleShape
                                     Column(
                                         Modifier
                                             .fillMaxSize()
@@ -622,7 +854,10 @@ fun AppGrid(t: Term, list: List<App>, modifier: Modifier = Modifier) {
 @Composable
 fun Keyboard(t: Term) {
     var caps by remember { mutableStateOf(false) }
+    var ctrl by remember { mutableStateOf(false) }
+    var sym by remember { mutableStateOf(false) }
     fun ch(c: Char) {
+        if (ctrl) { t.ctrl(c); ctrl = false; return }
         t.type(if (caps) c.uppercase() else c.toString())
         caps = false
     }
@@ -635,27 +870,41 @@ fun Keyboard(t: Term) {
             .padding(horizontal = 3.dp, vertical = 4.dp)
     ) {
         Row { "1234567890".forEach { c -> KBtn(c.toString()) { t.type(c.toString()) } } }
-        Row { "qwertyuiop".forEach { c -> KBtn(label(c)) { ch(c) } } }
-        Row {
-            Spacer(Modifier.weight(0.5f))
-            "asdfghjkl".forEach { c -> KBtn(label(c)) { ch(c) } }
-            Spacer(Modifier.weight(0.5f))
+        if (!sym) {
+            Row { "qwertyuiop".forEach { c -> KBtn(label(c)) { ch(c) } } }
+            Row {
+                Spacer(Modifier.weight(0.5f))
+                "asdfghjkl".forEach { c -> KBtn(label(c)) { ch(c) } }
+                Spacer(Modifier.weight(0.5f))
+            }
+            Row {
+                KBtn("⇧", 1.5f, hl = caps) { caps = !caps }
+                "zxcvbnm".forEach { c -> KBtn(label(c)) { ch(c) } }
+                KBtn("⌫", 1.5f, onLong = { t.input = "" }) { t.back() }
+            }
+        } else {
+            Row { "!@#\$%^&*()".forEach { c -> KBtn(c.toString()) { t.type(c.toString()) } } }
+            Row { "|;:<>?~`_,".forEach { c -> KBtn(c.toString()) { t.type(c.toString()) } } }
+            Row {
+                "=+[]{}'\"\\".forEach { c -> KBtn(c.toString()) { t.type(c.toString()) } }
+                KBtn("⌫", 1.5f, onLong = { t.input = "" }) { t.back() }
+            }
         }
         Row {
-            KBtn("⇧", 1.5f, hl = caps) { caps = !caps }
-            "zxcvbnm".forEach { c -> KBtn(label(c)) { ch(c) } }
-            KBtn("⌫", 1.5f, onLong = { t.input = "" }) { t.back() }
-        }
-        Row {
+            KBtn("ctrl", hl = ctrl) { ctrl = !ctrl }
+            KBtn("tab") { t.tab() }
+            KBtn(if (sym) "abc" else "sym", hl = sym) { sym = !sym }
             KBtn("-") { t.type("-") }
             KBtn(".") { t.type(".") }
             KBtn("/") { t.type("/") }
-            KBtn("space", 2.5f) { t.type(" ") }
             KBtn("←") { t.arrow(-1, 0) }
             KBtn("↑") { t.arrow(0, -1) }
             KBtn("↓") { t.arrow(0, 1) }
             KBtn("→") { t.arrow(1, 0) }
-            KBtn("⏎", 1.5f, hl = true) { t.enter() }
+        }
+        Row {
+            KBtn("space", 8f) { t.type(" ") }
+            KBtn("⏎", 2f, hl = true) { t.enter() }
         }
     }
 }
@@ -672,26 +921,38 @@ fun RowScope.KBtn(
     Box(
         Modifier
             .weight(w)
-            .height(42.dp)
+            .height(40.dp)
             .padding(2.dp)
-            .clip(RoundedCornerShape(6.dp))
+            .clip(RectangleShape)
             .background(if (hl) ACC else KEYBG)
             .combinedClickable(onClick = onClick, onLongClick = onLong),
         contentAlignment = Alignment.Center
     ) {
-        Text(label, color = if (hl) BG else FG, fontFamily = Mono, fontSize = 15.sp)
+        Text(label, color = if (hl) BG else FG, fontFamily = Mono, fontSize = if (label.length >= 4) 11.sp else 15.sp)
     }
 }
 
 
 class Theme(val bg: Color, val fg: Color, val dim: Color, val acc: Color, val key: Color)
 
-val THEMES = mapOf(
+val THEMES = linkedMapOf(
     "charcoal" to Theme(Color(0xFF181818), Color(0xFFD4CBB8), Color(0xFF7A7468), Color(0xFFC8A15A), Color(0xFF262626)),
     "green" to Theme(Color(0xFF0A0F0A), Color(0xFF9BE59B), Color(0xFF4F7A4F), Color(0xFF33FF66), Color(0xFF142014)),
     "amber" to Theme(Color(0xFF120D00), Color(0xFFFFB000), Color(0xFF7A5600), Color(0xFFFFD060), Color(0xFF201800)),
     "blue" to Theme(Color(0xFF1B1F2A), Color(0xFFC8D3F5), Color(0xFF5A6788), Color(0xFF82AAFF), Color(0xFF252B3B)),
-    "mono" to Theme(Color(0xFF000000), Color(0xFFE0E0E0), Color(0xFF777777), Color(0xFFFFFFFF), Color(0xFF1C1C1C))
+    "mono" to Theme(Color(0xFF000000), Color(0xFFE0E0E0), Color(0xFF777777), Color(0xFFFFFFFF), Color(0xFF1C1C1C)),
+    "dracula" to Theme(Color(0xFF282A36), Color(0xFFF8F8F2), Color(0xFF6272A4), Color(0xFFBD93F9), Color(0xFF343746)),
+    "nord" to Theme(Color(0xFF2E3440), Color(0xFFD8DEE9), Color(0xFF616E88), Color(0xFF88C0D0), Color(0xFF3B4252)),
+    "gruvbox" to Theme(Color(0xFF282828), Color(0xFFEBDBB2), Color(0xFF928374), Color(0xFFFABD2F), Color(0xFF3C3836)),
+    "solarized" to Theme(Color(0xFF002B36), Color(0xFF93A1A1), Color(0xFF586E75), Color(0xFFB58900), Color(0xFF073642)),
+    "monokai" to Theme(Color(0xFF272822), Color(0xFFF8F8F2), Color(0xFF75715E), Color(0xFFA6E22E), Color(0xFF3E3D32)),
+    "tokyonight" to Theme(Color(0xFF1A1B26), Color(0xFFC0CAF5), Color(0xFF565F89), Color(0xFF7AA2F7), Color(0xFF24283B)),
+    "catppuccin" to Theme(Color(0xFF1E1E2E), Color(0xFFCDD6F4), Color(0xFF6C7086), Color(0xFFCBA6F7), Color(0xFF313244)),
+    "onedark" to Theme(Color(0xFF282C34), Color(0xFFABB2BF), Color(0xFF5C6370), Color(0xFF61AFEF), Color(0xFF3E4451)),
+    "rosepine" to Theme(Color(0xFF191724), Color(0xFFE0DEF4), Color(0xFF6E6A86), Color(0xFFEBBCBA), Color(0xFF26233A)),
+    "everforest" to Theme(Color(0xFF2D353B), Color(0xFFD3C6AA), Color(0xFF859289), Color(0xFFA7C080), Color(0xFF343F44)),
+    "kanagawa" to Theme(Color(0xFF1F1F28), Color(0xFFDCD7BA), Color(0xFF727169), Color(0xFFE6C384), Color(0xFF2A2A37)),
+    "ayu" to Theme(Color(0xFF0B0E14), Color(0xFFBFBDB6), Color(0xFF565B66), Color(0xFFFFB454), Color(0xFF131721))
 )
 
 fun applyTheme(n: String): Boolean {
